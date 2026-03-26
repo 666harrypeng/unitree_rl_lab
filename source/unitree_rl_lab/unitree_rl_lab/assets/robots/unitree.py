@@ -9,6 +9,7 @@ Reference: https://github.com/unitreerobotics/unitree_ros
 """
 
 import os
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
@@ -17,8 +18,37 @@ from isaaclab.utils import configclass
 
 from unitree_rl_lab.assets.robots import unitree_actuators
 
-UNITREE_MODEL_DIR = "path/to/unitree_model"  # Replace with the actual path to your unitree_model directory
-UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
+_UNITREE_RL_LAB_REPO_ROOT = Path(__file__).resolve().parents[5]
+_WORKSPACE_ROOT = _UNITREE_RL_LAB_REPO_ROOT.parent
+
+
+def _default_unitree_model_dir() -> str:
+    candidate = _WORKSPACE_ROOT / "unitree_model"
+    return str(candidate) if candidate.exists() else "path/to/unitree_model"
+
+
+def _default_unitree_ros_dir() -> str:
+    candidate = _WORKSPACE_ROOT / "unitree_ros"
+    return str(candidate) if candidate.exists() else "path/to/unitree_ros"
+
+
+UNITREE_MODEL_DIR = os.environ.get(
+    "UNITREE_MODEL_DIR", _default_unitree_model_dir()
+)  # Replace with the actual path to your unitree_model directory
+UNITREE_ROS_DIR = os.environ.get(
+    "UNITREE_ROS_DIR", _default_unitree_ros_dir()
+)  # Replace with the actual path to your unitree_ros package
+
+
+def _has_valid_path(path: str) -> bool:
+    return bool(path) and not path.startswith("path/to/") and os.path.exists(path)
+
+
+def _unitree_spawn_cfg(*, usd_path: str, urdf_path: str | None = None):
+    """Prefer a local URDF asset when available; otherwise fall back to USD."""
+    if urdf_path is not None and _has_valid_path(UNITREE_ROS_DIR):
+        return UnitreeUrdfFileCfg(asset_path=urdf_path)
+    return UnitreeUsdFileCfg(usd_path=usd_path)
 
 
 @configclass
@@ -395,10 +425,8 @@ UNITREE_G1_23DOF_CFG = UnitreeArticulationCfg(
 )
 
 UNITREE_G1_29DOF_CFG = UnitreeArticulationCfg(
-    # spawn=UnitreeUrdfFileCfg(
-    #     asset_path=f"{UNITREE_ROS_DIR}/robots/g1_description/g1_29dof_rev_1_0.urdf",
-    # ),
-    spawn=UnitreeUsdFileCfg(
+    spawn=_unitree_spawn_cfg(
+        urdf_path=f"{UNITREE_ROS_DIR}/robots/g1_description/g1_29dof_rev_1_0.urdf",
         usd_path=f"{UNITREE_MODEL_DIR}/G1/29dof/usd/g1_29dof_rev_1_0/g1_29dof_rev_1_0.usd",
     ),
     init_state=ArticulationCfg.InitialStateCfg(
@@ -529,10 +557,8 @@ DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ  # 6.308
 DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ  # 1.06814150219
 
 UNITREE_G1_29DOF_MIMIC_CFG = UnitreeArticulationCfg(
-    # spawn=UnitreeUrdfFileCfg(
-    #     asset_path=f"{UNITREE_ROS_DIR}/robots/g1_description/g1_29dof_rev_1_0.urdf",
-    # ),
-    spawn=UnitreeUsdFileCfg(
+    spawn=_unitree_spawn_cfg(
+        urdf_path=f"{UNITREE_ROS_DIR}/robots/g1_description/g1_29dof_rev_1_0.urdf",
         usd_path=f"{UNITREE_MODEL_DIR}/G1/29dof/usd/g1_29dof_rev_1_0/g1_29dof_rev_1_0.usd",
     ),
     init_state=ArticulationCfg.InitialStateCfg(

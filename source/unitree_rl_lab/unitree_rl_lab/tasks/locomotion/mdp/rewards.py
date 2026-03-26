@@ -14,6 +14,23 @@ from isaaclab.sensors import ContactSensor
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+
+def _standing_command_mask(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Return a boolean mask for stand-mode commands."""
+    command = env.command_manager.get_command(command_name)
+    command_norm = torch.norm(command, dim=1)
+    standing_mask = command_norm < command_threshold
+
+    command_term = env.command_manager.get_term(command_name)
+    if hasattr(command_term, "is_standing_env"):
+        standing_mask = torch.logical_or(standing_mask, command_term.is_standing_env)
+
+    return standing_mask
+
 """
 Joint penalties.
 """
@@ -118,14 +135,38 @@ def feet_height_body(
 
 
 def foot_clearance_reward(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, target_height: float, std: float, tanh_mult: float
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+    tanh_mult: float,
+    command_threshold: float = 0.1,
+    command_name: str = "base_velocity",
+    respect_standing_env: bool = False,
 ) -> torch.Tensor:
     """Reward the swinging feet for clearing a specified height off the ground"""
     asset: RigidObject = env.scene[asset_cfg.name]
     foot_z_target_error = torch.square(asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - target_height)
     foot_velocity_tanh = torch.tanh(tanh_mult * torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2))
-    reward = foot_z_target_error * foot_velocity_tanh
-    return torch.exp(-torch.sum(reward, dim=1) / std)
+    swing_match = torch.exp(-foot_z_target_error / std) * foot_velocity_tanh
+    command_norm = torch.norm(env.command_manager.get_command(command_name), dim=1, keepdim=True)
+    moving_mask = command_norm > command_threshold
+    if respect_standing_env:
+        moving_mask = ~_standing_command_mask(env, command_name=command_name, command_threshold=command_threshold)
+        moving_mask = moving_mask.unsqueeze(1)
+    swing_match = swing_match * moving_mask
+    return torch.mean(swing_match, dim=1)
+
+
+def forward_velocity_shortfall(
+    env: ManagerBasedRLEnv, command_name: str = "base_velocity", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Penalize not achieving commanded forward velocity in the body frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    cmd_x = torch.clamp(command[:, 0], min=0.0)
+    vel_x = asset.data.root_lin_vel_b[:, 0]
+    return torch.clamp(cmd_x - vel_x, min=0.0)
 
 
 def feet_too_near(
@@ -178,6 +219,8 @@ def feet_gait(
     sensor_cfg: SceneEntityCfg,
     threshold: float = 0.5,
     command_name=None,
+    command_threshold: float = 0.1,
+    respect_standing_env: bool = False,
 ) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
@@ -195,9 +238,82 @@ def feet_gait(
         reward += ~(is_stance ^ is_contact[:, i])
 
     if command_name is not None:
-        cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
-        reward *= cmd_norm > 0.1
+        if respect_standing_env:
+            reward *= ~_standing_command_mask(env, command_name=command_name, command_threshold=command_threshold)
+        else:
+            cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+            reward *= cmd_norm > command_threshold
     return reward
+
+
+def quiet_stand_reward(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    lin_vel_std: float = 0.15,
+    ang_vel_std: float = 0.35,
+) -> torch.Tensor:
+    """Reward quiet double-support standing when the command requests standing."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    standing_mask = _standing_command_mask(env, command_name=command_name, command_threshold=command_threshold)
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    double_support = torch.mean(is_contact.float(), dim=1)
+
+    lin_vel_xy = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    ang_vel = torch.norm(asset.data.root_ang_vel_b, dim=1)
+    upright = torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 1.0)
+
+    reward = double_support
+    reward = reward * torch.exp(-torch.square(lin_vel_xy / lin_vel_std))
+    reward = reward * torch.exp(-torch.square(ang_vel / ang_vel_std))
+    reward = reward * upright
+    return reward * standing_mask.float()
+
+
+def single_leg_stand_under_zero_cmd(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize persistent single-leg support when the command requests standing."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    standing_mask = _standing_command_mask(env, command_name=command_name, command_threshold=command_threshold)
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    contact_count = torch.sum(is_contact, dim=1)
+    single_support = contact_count == 1
+    return single_support.float() * standing_mask.float()
+
+
+def swing_foot_backward_kick_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.05,
+    velocity_tolerance: float = 0.05,
+) -> torch.Tensor:
+    """Penalize swing feet moving strongly backward in the body frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    standing_mask = _standing_command_mask(env, command_name=command_name, command_threshold=command_threshold)
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    swing_mask = (~is_contact).float()
+
+    cur_footvel_translated = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :] - asset.data.root_lin_vel_w[:, :].unsqueeze(1)
+    footvel_in_body_frame = torch.zeros(env.num_envs, len(asset_cfg.body_ids), 3, device=env.device)
+    for i in range(len(asset_cfg.body_ids)):
+        footvel_in_body_frame[:, i, :] = quat_apply_inverse(asset.data.root_quat_w, cur_footvel_translated[:, i, :])
+
+    backward_speed = (-footvel_in_body_frame[:, :, 0] - velocity_tolerance).clamp(min=0.0)
+    swing_count = swing_mask.sum(dim=1).clamp(min=1.0)
+    penalty = torch.sum(backward_speed * swing_mask, dim=1) / swing_count
+    return penalty * (~standing_mask).float()
 
 
 """

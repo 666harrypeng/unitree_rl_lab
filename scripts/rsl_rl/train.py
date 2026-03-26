@@ -9,7 +9,10 @@
 
 
 import gymnasium as gym
+import json
+import math
 import pathlib
+import statistics
 import sys
 
 sys.path.insert(0, f"{pathlib.Path(__file__).parent.parent}")
@@ -90,6 +93,7 @@ import inspect
 import os
 import shutil
 import torch
+from copy import deepcopy
 from datetime import datetime
 
 from rsl_rl.runners import OnPolicyRunner  # TODO: Consider printing the experiment name in the terminal.
@@ -115,6 +119,121 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _collect_rsl_rl_metrics(runner) -> dict[str, float]:
+    """Collect a compact set of scalar metrics from the current logger state."""
+
+    metrics: dict[str, float] = {}
+    log = runner.logger
+
+    if len(log.rewbuffer) > 0:
+        metrics["Train/mean_reward"] = float(statistics.mean(log.rewbuffer))
+    if len(log.lenbuffer) > 0:
+        metrics["Train/mean_episode_length"] = float(statistics.mean(log.lenbuffer))
+
+    if log.ep_extras:
+        for key in log.ep_extras[0]:
+            values = []
+            for ep_info in log.ep_extras:
+                if key not in ep_info:
+                    continue
+                value = ep_info[key]
+                if not isinstance(value, torch.Tensor):
+                    value = torch.tensor([value], device=log.device)
+                if len(value.shape) == 0:
+                    value = value.unsqueeze(0)
+                values.append(value.to(log.device))
+            if values:
+                metric_name = key if "/" in key else "Episode/" + key
+                metrics[metric_name] = float(torch.cat(values).mean().item())
+
+    return metrics
+
+
+def _best_checkpoint_score(metrics: dict[str, float]) -> tuple:
+    """Score checkpoints using locomotion-relevant metrics rather than reward alone."""
+
+    time_out = metrics.get("Episode_Termination/time_out")
+    bad_orientation = metrics.get("Episode_Termination/bad_orientation")
+    error_vel_xy = metrics.get("Metrics/base_velocity/error_vel_xy")
+    error_vel_yaw = metrics.get("Metrics/base_velocity/error_vel_yaw")
+    mean_len = metrics.get("Train/mean_episode_length")
+    mean_reward = metrics.get("Train/mean_reward")
+
+    return (
+        (time_out if time_out is not None else -math.inf),
+        -(bad_orientation if bad_orientation is not None else math.inf),
+        -(error_vel_xy if error_vel_xy is not None else math.inf),
+        -(error_vel_yaw if error_vel_yaw is not None else math.inf),
+        (mean_len if mean_len is not None else -math.inf),
+        (mean_reward if mean_reward is not None else -math.inf),
+    )
+
+
+def _enable_best_model_checkpointing(runner) -> None:
+    """Patch the runner so every training run also maintains a best-model checkpoint."""
+
+    runner._pl_best_metrics = None
+    runner._pl_best_score = None
+    runner._pl_best_source_checkpoint = None
+
+    original_log = runner.logger.log
+    original_save = runner.save
+
+    def wrapped_log(*args, **kwargs):
+        runner._pl_best_metrics = _collect_rsl_rl_metrics(runner)
+        return original_log(*args, **kwargs)
+
+    def wrapped_save(path: str, infos: dict | None = None):
+        original_save(path, infos)
+
+        metrics = runner._pl_best_metrics
+        if not metrics:
+            return
+
+        score = _best_checkpoint_score(metrics)
+        if runner._pl_best_score is None or score > runner._pl_best_score:
+            runner._pl_best_score = score
+            runner._pl_best_source_checkpoint = path
+
+            best_path = os.path.join(runner.logger.log_dir, "best_model.pt")
+            original_save(best_path, {"source_checkpoint": path, "metrics": metrics})
+
+            best_meta_path = os.path.join(runner.logger.log_dir, "best_model_meta.json")
+            with open(best_meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "source_checkpoint": path,
+                        "best_model_path": best_path,
+                        "iter": runner.current_learning_iteration,
+                        "score": list(score),
+                        "metrics": metrics,
+                    },
+                    f,
+                    indent=2,
+                    sort_keys=True,
+                )
+
+            print(f"[INFO] Updated best model checkpoint: {best_path}")
+
+    runner.logger.log = wrapped_log
+    runner.save = wrapped_save
+
+
+def _sanitize_rsl_rl_cfg(cfg: dict) -> dict:
+    """Remove deprecated runner/model keys before handing config to rsl-rl 5.x."""
+    cfg = deepcopy(cfg)
+    deprecated_model_keys = ("stochastic", "init_noise_std", "noise_std_type", "state_dependent_std")
+    for model_key in ("actor", "critic"):
+        model_cfg = cfg.get(model_key)
+        if isinstance(model_cfg, dict):
+            for deprecated_key in deprecated_model_keys:
+                model_cfg.pop(deprecated_key, None)
+    policy_cfg = cfg.get("policy")
+    if isinstance(policy_cfg, dict) and not policy_cfg:
+        cfg["policy"] = {}
+    return cfg
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -181,7 +300,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # create runner from rsl-rl
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    runner_cfg_dict = _sanitize_rsl_rl_cfg(agent_cfg.to_dict())
+    runner = OnPolicyRunner(env, runner_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+    _enable_best_model_checkpointing(runner)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
